@@ -554,6 +554,198 @@ def evaluate_batch_parallel(batch_data):
 # Maps component name -> Genome that created it
 _discovered_genomes: Dict[str, Genome] = {}
 
+# Global list to track technology discoveries over time
+# Each entry: (generation, goal_name, distance_from_target, cost, is_solved)
+_technology_timeline: List[Tuple[int, str, int, int, bool]] = []
+
+
+def visualize_technology_timeline(filename: str = "technology_development_timeline.png", title: str = "Technology Development Over Time"):
+    """
+    Create a comprehensive visualization showing when all technologies were discovered/improved.
+    """
+    if not _technology_timeline:
+        print("No technology discoveries to visualize.")
+        return
+    
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    
+    # Group discoveries by goal
+    goal_discoveries = {}
+    for gen, goal_name, dist, cost, is_solved in _technology_timeline:
+        if goal_name not in goal_discoveries:
+            goal_discoveries[goal_name] = []
+        goal_discoveries[goal_name].append((gen, dist, cost, is_solved))
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
+    
+    # === Subplot 1: Timeline scatter plot ===
+    goal_names = sorted(goal_discoveries.keys())
+    colors = plt.cm.tab20(range(len(goal_names)))
+    goal_colors = {name: colors[i] for i, name in enumerate(goal_names)}
+    
+    # Plot discoveries for each goal
+    for goal_idx, goal_name in enumerate(goal_names):
+        discoveries = goal_discoveries[goal_name]
+        
+        # Separate solved from approximations
+        solved_gens = [gen for gen, dist, cost, solved in discoveries if solved]
+        approx_gens = [gen for gen, dist, cost, solved in discoveries if not solved]
+        
+        # Plot approximations as small circles
+        if approx_gens:
+            ax1.scatter(approx_gens, [goal_idx] * len(approx_gens), 
+                       c=[goal_colors[goal_name]], alpha=0.4, s=50, marker='o')
+        
+        # Plot solutions as stars
+        if solved_gens:
+            ax1.scatter(solved_gens, [goal_idx] * len(solved_gens), 
+                       c=[goal_colors[goal_name]], alpha=1.0, s=200, marker='*', 
+                       edgecolors='black', linewidths=1.5)
+    
+    ax1.set_yticks(range(len(goal_names)))
+    ax1.set_yticklabels(goal_names, fontsize=9)
+    ax1.set_xlabel('Generation', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Technology Goal', fontsize=12, fontweight='bold')
+    ax1.set_title('Technology Discovery Timeline', fontsize=14, fontweight='bold', pad=15)
+    ax1.grid(True, alpha=0.3, axis='x')
+    
+    # Legend
+    approx_patch = mpatches.Patch(color='gray', alpha=0.4, label='Approximation')
+    solved_marker = plt.Line2D([0], [0], marker='*', color='w', markerfacecolor='gold', 
+                              markersize=15, markeredgecolor='black', markeredgewidth=1.5, 
+                              label='Exact Solution')
+    ax1.legend(handles=[approx_patch, solved_marker], loc='upper left', fontsize=10)
+    
+    # === Subplot 2: Cumulative solutions over time ===
+    # Get all generations where solutions were found
+    solution_events = [(gen, goal_name) for gen, goal_name, dist, cost, solved in _technology_timeline if solved]
+    solution_events.sort()
+    
+    if solution_events:
+        generations = []
+        cumulative_count = []
+        count = 0
+        
+        for gen, goal_name in solution_events:
+            generations.append(gen)
+            count += 1
+            cumulative_count.append(count)
+        
+        ax2.plot(generations, cumulative_count, linewidth=3, color='#2E86AB', marker='o', 
+                markersize=8, markerfacecolor='#A23B72', markeredgecolor='black', markeredgewidth=1)
+        ax2.fill_between(generations, cumulative_count, alpha=0.2, color='#2E86AB')
+        
+        # Annotate final count
+        if cumulative_count:
+            ax2.text(generations[-1], cumulative_count[-1], f'  {cumulative_count[-1]} solved', 
+                    fontsize=11, fontweight='bold', va='center')
+    
+    ax2.set_xlabel('Generation', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Cumulative Solutions', fontsize=12, fontweight='bold')
+    ax2.set_title('Cumulative Technology Solutions', fontsize=14, fontweight='bold', pad=15)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(bottom=0)
+    
+    # Overall title
+    fig.suptitle(title, fontsize=16, fontweight='bold', y=0.995)
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=200, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\nSaved technology timeline visualization: {filename}")
+    print(f"Total discoveries logged: {len(_technology_timeline)}")
+    print(f"Total goals with discoveries: {len(goal_discoveries)}")
+    print(f"Total exact solutions: {sum(1 for _, _, _, _, solved in _technology_timeline if solved)}")
+
+
+def check_and_add_improvement(genome: Genome, phenotype: BoolFunction, goal: Goal, 
+                               lib: TechnologyLibrary, generation: int) -> Optional[Component]:
+    """
+    Check if this genome improves upon existing best approximations for the goal.
+    Returns the new component if it was an improvement, None otherwise.
+    
+    A circuit improves if:
+    1. It better matches the truth table (fewer errors), OR
+    2. It has identical function but lower cost
+    """
+    dist = phenotype.distance_to(goal.target)
+    cost = sum(inst.component.cost for inst in genome.instances) + 1
+    
+    # Check against existing best approximations
+    improved = False
+    replaced_component = None
+    
+    if not goal.best_components:
+        # No existing approximations, this is the first
+        improved = True
+    else:
+        for existing_comp in goal.best_components:
+            existing_dist = existing_comp.function.distance_to(goal.target)
+            
+            # Better match to truth table
+            if dist < existing_dist:
+                improved = True
+                replaced_component = existing_comp
+                break
+            # Same function but lower cost
+            elif dist == existing_dist and phenotype.is_equal(existing_comp.function) and cost < existing_comp.cost:
+                improved = True
+                replaced_component = existing_comp
+                break
+    
+    if improved:
+        # Create new component
+        if dist == 0:
+            # Exact match - use solved naming
+            comp_name = lib.new_name(f"{goal.name}_solved")
+            print(f"  SOLVED {goal.name} at Gen {generation}! (dist={dist}, cost={cost})")
+        else:
+            # Approximation - use tech naming
+            comp_name = lib.new_name(f"{goal.name}_approx")
+            print(f"  IMPROVED {goal.name} at Gen {generation}! (dist={dist}, cost={cost})")
+        
+        new_comp = Component(
+            name=comp_name,
+            function=phenotype,
+            cost=cost,
+            is_primitive=False
+        )
+        
+        # Add to library
+        from tech_evolution import evaluate_and_maybe_add
+        evaluate_and_maybe_add(lib, new_comp)
+        
+        # Store the genome
+        _discovered_genomes[new_comp.name] = copy.deepcopy(genome)
+        
+        # Log to timeline
+        is_solved = (dist == 0)
+        _technology_timeline.append((generation, goal.name, dist, cost, is_solved))
+        
+        # Update goal's best components
+        if replaced_component:
+            # Remove the old component from goal's best list
+            goal.best_components = [c for c in goal.best_components if c.name != replaced_component.name]
+            
+            # Also remove from the global library to prevent it from being used in new circuits
+            lib.technologies = [c for c in lib.technologies if c.name != replaced_component.name]
+            
+            # Remove from discovered genomes as well
+            if replaced_component.name in _discovered_genomes:
+                del _discovered_genomes[replaced_component.name]
+            
+            print(f"    Replaced {replaced_component.name} (dist={existing_dist}, cost={replaced_component.cost})")
+        
+        # Add new component
+        goal.best_components.append(new_comp)
+        
+        return new_comp
+    
+    return None
+
 
 def visualize_genome_detailed(genome: Genome, filename: str, title: str = "Genome", 
                                 discovered_genomes: Optional[Dict[str, Genome]] = None,
@@ -1054,27 +1246,17 @@ def run_hybrid_evolution(
                         for genome_id, fitness, unconnected_count, phenotype, is_solved in batch_results:
                             results_map[genome_id] = (fitness, unconnected_count, phenotype, is_solved)
                 
-                # Apply results to genomes
+                # Apply results to genomes and check for improvements
                 for g in population:
                     fitness, unconnected_count, phenotype, is_solved = results_map[g.id]
                     g.fitness = fitness
                     
-                    if is_solved:
+                    # Check if this genome improves the goal (exact match or better approximation)
+                    new_comp = check_and_add_improvement(g, phenotype, goal, lib, generation)
+                    
+                    if new_comp and is_solved:
                         solved = True
-                        # Encapsulate immediately
-                        cost = sum(inst.component.cost for inst in g.instances) + 1
-                        new_comp = Component(
-                            name=lib.new_name(f"{goal.name}_solved"),
-                            function=phenotype,
-                            cost=cost
-                        )
-                        from tech_evolution import evaluate_and_maybe_add
-                        evaluate_and_maybe_add(lib, new_comp)
-                        
-                        # Store the genome that created this technology
-                        _discovered_genomes[new_comp.name] = copy.deepcopy(g)
-                        
-                        print(f"  SOLVED {goal.name} at Gen {generation}! Added {new_comp.name}")
+                        cost = new_comp.cost
                         
                         # Visualize the solution - always save both normal and detailed versions
                         viz_filename_normal = f"genome_{goal.name}_solved.png"
@@ -1143,24 +1325,15 @@ def run_hybrid_evolution(
                     
                     # Ensure fitness doesn't go below 0 (optional)
                     fitness = max(0.0, fitness)
+                    g.fitness = fitness
 
-                    if fitness == max_dist:# and unconnected_count == 0: # Perfect match AND valid
+                    # Check if this genome improves the goal (exact match or better approximation)
+                    is_solved = (fitness == max_dist)
+                    new_comp = check_and_add_improvement(g, phenotype, goal, lib, generation)
+                    
+                    if new_comp and is_solved:
                         solved = True
-                        # Encapsulate immediately
-                        cost = sum(inst.component.cost for inst in g.instances) + 1 # Simple cost
-                        new_comp = Component(
-                            name=lib.new_name(f"{goal.name}_solved"),
-                            function=phenotype,
-                            cost=cost
-                        )
-                        # Add to library if it's new/better
-                        from tech_evolution import evaluate_and_maybe_add
-                        evaluate_and_maybe_add(lib, new_comp)
-                        
-                        # Store the genome that created this technology
-                        _discovered_genomes[new_comp.name] = copy.deepcopy(g)
-                        
-                        print(f"  SOLVED {goal.name} at Gen {generation}! Added {new_comp.name}")
+                        cost = new_comp.cost
                         
                         # Visualize the solution - always save both normal and detailed versions
                         viz_filename_normal = f"genome_{goal.name}_solved.png"
@@ -1197,12 +1370,19 @@ def run_hybrid_evolution(
             calculate_adjusted_fitness(species_list)
             
             if generation % 10 == 0:
-                print(f"  Gen {generation}: Best Fitness {best_fitness}/{max_dist} (Unconnected: {best_unconnected}, Species: {len(species_list)})")
+                # Show best approximation info
+                best_approx_str = ""
+                if goal.best_components:
+                    best_comp = min(goal.best_components, key=lambda c: c.function.distance_to(goal.target))
+                    best_dist = best_comp.function.distance_to(goal.target)
+                    best_approx_str = f", BestApprox: {best_dist}/{max_dist}"
+                
+                print(f"  Gen {generation}: Best Fitness {best_fitness}/{max_dist} (Unconnected: {best_unconnected}, Species: {len(species_list)}{best_approx_str})")
                 
                 # Log to wandb
                 if use_wandb:
                     import wandb
-                    wandb.log({
+                    log_dict = {
                         f"{goal.name}/generation": generation,
                         f"{goal.name}/best_fitness": best_fitness,
                         f"{goal.name}/max_fitness": max_dist,
@@ -1213,7 +1393,17 @@ def run_hybrid_evolution(
                         f"{goal.name}/best_num_components": len(best_genome.instances) if best_genome else 0,
                         f"{goal.name}/best_num_connections": sum(1 for c in best_genome.connections if c.enabled) if best_genome else 0,
                         "total_technologies": len(lib.technologies)
-                    })
+                    }
+                    
+                    # Add best approximation metrics
+                    if goal.best_components:
+                        best_comp = min(goal.best_components, key=lambda c: c.function.distance_to(goal.target))
+                        best_dist = best_comp.function.distance_to(goal.target)
+                        log_dict[f"{goal.name}/best_approx_dist"] = best_dist
+                        log_dict[f"{goal.name}/best_approx_cost"] = best_comp.cost
+                        log_dict[f"{goal.name}/num_approximations"] = len(goal.best_components)
+                    
+                    wandb.log(log_dict)
 
             # 2. Selection & Reproduction with Speciation
             # Sort by adjusted_fitness instead of raw fitness
@@ -1294,9 +1484,16 @@ def run_hybrid_evolution(
     print("\nEvolution finished.")
     print(f"Total technologies in library: {len(lib.technologies)}")
     
+    # Generate technology timeline visualization
+    timeline_filename = "technology_development_timeline.png"
+    visualize_technology_timeline(timeline_filename, "Assembly Search: Technology Development Timeline")
+    
     # Finish wandb run
     if use_wandb:
         import wandb
+        # Log the timeline visualization
+        if _technology_timeline:
+            wandb.log({"technology_timeline": wandb.Image(timeline_filename)})
         wandb.finish()
 
 if __name__ == "__main__":
