@@ -291,9 +291,12 @@ def mutate_add_connection(genome: Genome, prob: float = 0.5):
         src = random.choice(sources)
         dst = random.choice(dests)
         
-        # Check if exists
+        # Check if exists or if destination already has a driver
         exists = False
         for conn in genome.connections:
+            if not conn.enabled:
+                continue
+            
             # Parse conn structure mapping
             # src is (type, id), dst is (type, id)
             # conn.src_id for comp_out is tuple, etc.
@@ -301,7 +304,13 @@ def mutate_add_connection(genome: Genome, prob: float = 0.5):
             c_src = (conn.src_type, conn.src_id)
             c_dst = (conn.dst_type, conn.dst_id)
             
+            # Check if exact same connection already exists
             if c_src == src and c_dst == dst:
+                exists = True
+                break
+            
+            # Check if destination already has a driver (prevent multiple drivers)
+            if c_dst == dst:
                 exists = True
                 break
         
@@ -324,48 +333,47 @@ def mutate_add_connection(genome: Genome, prob: float = 0.5):
 def mutate_add_component(genome: Genome, lib: TechnologyLibrary, prob: float = 0.1):
     if random.random() > prob: return
     
-    # NEAT style: Split an existing connection
     if not genome.connections: return
     
-    conn = random.choice(genome.connections)
-    if not conn.enabled: return
+    # Get a valid enabled connection to split
+    valid_conns = [c for c in genome.connections if c.enabled]
+    if not valid_conns: return
+    conn = random.choice(valid_conns)
     
-    #print name of conn
     conn.enabled = False
     
-    # Select component from library to insert
-    # Standard: Primitives or discovered techs
-    # Use selection probabilities
+    # Select component
     comp_template = copy.deepcopy(select_component_wrapper(lib))
-    
     new_inst_id = max([i.id for i in genome.instances] + [0]) + 1
     new_inst = ComponentInstance(new_inst_id, comp_template)
     genome.instances.append(new_inst)
-    #print name of selected tech    print(comp_template.name)
-    #print(f"Selected tech: {comp_template.name}")
 
-    # Wire: Src -> NewComp -> Dst
-    # Connect original Src to first input of NewComp
-    # Connect first output of NewComp to original Dst
-    # (Simplified assumption: component has at least 1 in/1 out. Most do.)
+    # Wire only one random input and one random output of the new component
+    # Choose random input pin
+    random_in_pin = random.randint(0, comp_template.function.n_inputs - 1) if comp_template.function.n_inputs > 0 else 0
     
-    # 1. Src -> NewIn[0]
-    if comp_template.function.n_inputs > 0:
-        c1 = ConnectionGene(
-            src_type=conn.src_type, src_id=conn.src_id,
-            dst_type='comp_in', dst_id=(new_inst_id, 0),
-            enabled=True
-        )
-        genome.connections.append(c1)
-        
-    # 2. NewOut[0] -> Dst
-    if comp_template.function.n_outputs > 0:
-        c2 = ConnectionGene(
-            src_type='comp_out', src_id=(new_inst_id, 0),
-            dst_type=conn.dst_type, dst_id=conn.dst_id,
-            enabled=True
-        )
-        genome.connections.append(c2)
+    # Connect source -> new_comp.in[random_in_pin]
+    c_in = ConnectionGene(
+        src_type=conn.src_type, 
+        src_id=conn.src_id,
+        dst_type='comp_in', 
+        dst_id=(new_inst_id, random_in_pin),
+        enabled=True
+    )
+    genome.connections.append(c_in)
+    
+    # Choose random output pin
+    random_out_pin = random.randint(0, comp_template.function.n_outputs - 1) if comp_template.function.n_outputs > 0 else 0
+    
+    # Connect new_comp.out[random_out_pin] -> original destination
+    c_out = ConnectionGene(
+        src_type='comp_out', 
+        src_id=(new_inst_id, random_out_pin),
+        dst_type=conn.dst_type, 
+        dst_id=conn.dst_id,
+        enabled=True
+    )
+    genome.connections.append(c_out)
 
 def select_component_wrapper(lib: TechnologyLibrary) -> Component:
     # Wrapper around the original random selection
@@ -519,7 +527,7 @@ def evaluate_genome_parallel(genome_goal_tuple):
             if not connected: unconnected_count += 1
     
     fitness = max(0.0, fitness)
-    solved = (fitness == max_dist and unconnected_count == 0)  # Perfect match AND valid
+    solved = (fitness == max_dist)# and unconnected_count == 0)  # Perfect match AND valid
     
     return (genome.id, fitness, unconnected_count, phenotype, solved)
 
@@ -647,10 +655,48 @@ def run_hybrid_evolution(
     speciation_threshold: float = 0.6,
     distance_weight_connections: float = 1.0,
     distance_weight_components: float = 1.0,
-    num_workers: int = 1
+    num_workers: int = 1,
+    use_wandb: bool = False,
+    wandb_project: str = "assembly_search",
+    init_with_library: bool = False,
+    prob_add_connection: float = 0.8,
+    prob_add_component: float = 0.2,
+    prob_remove_connection: float = 0.1
 ):
     if seed is not None:
         random.seed(seed)
+    
+    # Initialize wandb if requested
+    if use_wandb:
+        import wandb
+        # Generate a descriptive run name
+        if target_goals and len(target_goals) <= 3:
+            goal_names = "-".join(target_goals)
+        elif target_goals:
+            goal_names = f"{len(target_goals)}_goals"
+        else:
+            goal_names = "all_goals"
+        
+        run_name = f"{goal_names}_gen{generations_per_goal}_pop{pop_size}_spec{speciation_threshold}_seed{seed if seed else 'random'}"
+        
+        wandb.init(
+            project=wandb_project,
+            name=run_name,
+            config={
+                "generations_per_goal": generations_per_goal,
+                "pop_size": pop_size,
+                "speciation_threshold": speciation_threshold,
+                "distance_weight_connections": distance_weight_connections,
+                "distance_weight_components": distance_weight_components,
+                "num_workers": num_workers,
+                "seed": seed,
+                "target_goals": target_goals if target_goals else "all",
+                "init_with_library": init_with_library,
+                "prob_add_connection": prob_add_connection,
+                "prob_add_component": prob_add_component,
+                "prob_remove_connection": prob_remove_connection
+            }
+        )
 
     lib = TechnologyLibrary()
     make_nand_primitive(lib)
@@ -682,14 +728,27 @@ def run_hybrid_evolution(
         for i in range(pop_size):
             g = Genome(id=i, n_global_inputs=goal.target.n_inputs, n_global_outputs=goal.target.n_outputs)
             
-            # Initialize with random connections to ensure connectivity
-            # Add a few random connections (e.g. 1-3)
-            for _ in range(random.randint(1, 5)):
-                mutate_add_connection(g)
-            
-            # Maybe add a component or two?
-            if random.random() < 0.5:
-                mutate_add_component(g, lib)
+            if init_with_library:
+                # Add 2-12 random components from the library
+                num_components = random.randint(2, 12)
+                for comp_idx in range(num_components):
+                    comp_template = copy.deepcopy(select_component_wrapper(lib))
+                    new_inst = ComponentInstance(comp_idx, comp_template)
+                    g.instances.append(new_inst)
+                
+                # Wire them up randomly with multiple connections
+                num_connections = random.randint(num_components * 2, num_components * 5)
+                for _ in range(num_connections):
+                    mutate_add_connection(g, prob=1.0)
+            else:
+                # Minimal initialization: just a few random connections
+                # Add a few random connections (e.g. 1-5)
+                for _ in range(random.randint(1, 5)):
+                    mutate_add_connection(g, prob=1.0)
+                
+                # Maybe add a component or two?
+                if random.random() < 0.5:
+                    mutate_add_component(g, lib, prob=1.0)
                 
             population.append(g)
             
@@ -735,6 +794,18 @@ def run_hybrid_evolution(
                         # Visualize the solution
                         viz_filename = f"genome_{goal.name}_solved.png"
                         visualize_genome(g, viz_filename, title=f"Solution for {goal.name} (Gen {generation})")
+                        
+                        # Log to wandb
+                        if use_wandb:
+                            import wandb
+                            wandb.log({
+                                f"{goal.name}/solved": True,
+                                f"{goal.name}/solved_generation": generation,
+                                f"{goal.name}/solved_cost": cost,
+                                f"{goal.name}/solved_num_components": len(g.instances),
+                                f"{goal.name}/solved_num_connections": sum(1 for c in g.connections if c.enabled),
+                                f"{goal.name}/genome_viz": wandb.Image(viz_filename)
+                            })
                         break
                     
                     if fitness > best_fitness:
@@ -801,6 +872,18 @@ def run_hybrid_evolution(
                         viz_filename = f"genome_{goal.name}_solved.png"
                         visualize_genome(g, viz_filename, title=f"Solution for {goal.name} (Gen {generation})")
                         
+                        # Log to wandb
+                        if use_wandb:
+                            import wandb
+                            wandb.log({
+                                f"{goal.name}/solved": True,
+                                f"{goal.name}/solved_generation": generation,
+                                f"{goal.name}/solved_cost": cost,
+                                f"{goal.name}/solved_num_components": len(g.instances),
+                                f"{goal.name}/solved_num_connections": sum(1 for c in g.connections if c.enabled),
+                                f"{goal.name}/genome_viz": wandb.Image(viz_filename)
+                            })
+                        
                         break
                     
                     if fitness > best_fitness:
@@ -816,6 +899,22 @@ def run_hybrid_evolution(
             
             if generation % 10 == 0:
                 print(f"  Gen {generation}: Best Fitness {best_fitness}/{max_dist} (Unconnected: {best_unconnected}, Species: {len(species_list)})")
+                
+                # Log to wandb
+                if use_wandb:
+                    import wandb
+                    wandb.log({
+                        f"{goal.name}/generation": generation,
+                        f"{goal.name}/best_fitness": best_fitness,
+                        f"{goal.name}/max_fitness": max_dist,
+                        f"{goal.name}/best_fitness_pct": (best_fitness / max_dist) * 100 if max_dist > 0 else 0,
+                        f"{goal.name}/avg_fitness": sum(g.fitness for g in population) / len(population),
+                        f"{goal.name}/num_species": len(species_list),
+                        f"{goal.name}/best_unconnected": best_unconnected,
+                        f"{goal.name}/best_num_components": len(best_genome.instances) if best_genome else 0,
+                        f"{goal.name}/best_num_connections": sum(1 for c in best_genome.connections if c.enabled) if best_genome else 0,
+                        "total_technologies": len(lib.technologies)
+                    })
 
             # 2. Selection & Reproduction with Speciation
             # Sort by adjusted_fitness instead of raw fitness
@@ -855,9 +954,9 @@ def run_hybrid_evolution(
                         child.id = len(next_pop) + generation * 10000  # Unique ID
                         
                         # Mutate
-                        if random.random() < 0.8: mutate_add_connection(child)
-                        if random.random() < 0.3: mutate_add_component(child, lib)
-                        if random.random() < 0.1: mutate_remove_connection(child)
+                        if random.random() < prob_add_connection: mutate_add_connection(child, prob=1.0)
+                        if random.random() < prob_add_component: mutate_add_component(child, lib, prob=1.0)
+                        if random.random() < prob_remove_connection: mutate_remove_connection(child, prob=1.0)
                         
                         next_pop.append(child)
             
@@ -867,8 +966,8 @@ def run_hybrid_evolution(
                     parent = random.choice(population)
                     child = parent.clone()
                     child.id = len(next_pop) + generation * 10000
-                    if random.random() < 0.8: mutate_add_connection(child)
-                    if random.random() < 0.3: mutate_add_component(child, lib)
+                    if random.random() < prob_add_connection: mutate_add_connection(child, prob=1.0)
+                    if random.random() < prob_add_component: mutate_add_component(child, lib, prob=1.0)
                     next_pop.append(child)
                 else:
                     break
@@ -877,9 +976,29 @@ def run_hybrid_evolution(
             next_pop = next_pop[:pop_size]
             
             population = next_pop
+        
+        # After all generations for this goal, check if solved
+        if not solved:
+            print(f"  Did not solve {goal.name} after {generations_per_goal} generations.")
+            print(f"  Best fitness: {best_fitness}/{max_dist}")
+            
+            # Log to wandb
+            if use_wandb:
+                import wandb
+                wandb.log({
+                    f"{goal.name}/solved": False,
+                    f"{goal.name}/final_best_fitness": best_fitness,
+                    f"{goal.name}/final_max_fitness": max_dist,
+                    f"{goal.name}/final_best_fitness_pct": (best_fitness / max_dist) * 100 if max_dist > 0 else 0
+                })
 
     print("\nEvolution finished.")
     print(f"Total technologies in library: {len(lib.technologies)}")
+    
+    # Finish wandb run
+    if use_wandb:
+        import wandb
+        wandb.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run hybrid NEAT evolution for technology discovery.")
@@ -890,14 +1009,20 @@ if __name__ == "__main__":
     parser.add_argument("--speciation-threshold", type=float, default=0.7, help="Compatibility distance threshold for speciation (higher = fewer species).")
     parser.add_argument("--distance-weight-connections", type=float, default=0.3, help="Weight for connection topology in distance calculation.")
     parser.add_argument("--distance-weight-components", type=float, default=1.0, help="Weight for component types in distance calculation.")
-    parser.add_argument("--num-workers", type=int, default=1, help="Number of parallel workers for genome evaluation (default: 1 = serial, use -1 for CPU count).")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of parallel workers for genome evaluation (default: 1 = serial, use -1 for CPU count, capped at 4).")
+    parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb-project", type=str, default="assembly_search", help="Weights & Biases project name.")
+    parser.add_argument("--init-with-library", action="store_true", help="Initialize genomes with 2-12 random library components wired together (default: minimal initialization).")
+    parser.add_argument("--prob-add-connection", type=float, default=0.8, help="Probability of adding a connection during mutation (default: 0.8).")
+    parser.add_argument("--prob-add-component", type=float, default=0.2, help="Probability of adding a component during mutation (default: 0.2).")
+    parser.add_argument("--prob-remove-connection", type=float, default=0.1, help="Probability of removing a connection during mutation (default: 0.1).")
     
     args = parser.parse_args()
     
-    # Handle num_workers = -1 (auto-detect CPU count)
+    # Handle num_workers = -1 (auto-detect CPU count, capped at 4)
     num_workers = args.num_workers
     if num_workers == -1:
-        num_workers = multiprocessing.cpu_count()
+        num_workers = min(4, multiprocessing.cpu_count())
     
     run_hybrid_evolution(
         pop_size=args.pop_size,
@@ -907,6 +1032,11 @@ if __name__ == "__main__":
         speciation_threshold=args.speciation_threshold,
         distance_weight_connections=args.distance_weight_connections,
         distance_weight_components=args.distance_weight_components,
-        num_workers=num_workers
+        num_workers=num_workers,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        init_with_library=args.init_with_library,
+        prob_add_connection=args.prob_add_connection,
+        prob_add_component=args.prob_add_component,
+        prob_remove_connection=args.prob_remove_connection
     )
-
