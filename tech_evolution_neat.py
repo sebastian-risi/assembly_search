@@ -532,15 +532,263 @@ def evaluate_genome_parallel(genome_goal_tuple):
     return (genome.id, fitness, unconnected_count, phenotype, solved)
 
 
+def evaluate_batch_parallel(batch_data):
+    """
+    Evaluate a batch of genomes in parallel to reduce pickling overhead.
+    batch_data: (genome_list, goal)
+    Returns: list of (genome_id, fitness, unconnected_count, phenotype, solved) tuples
+    """
+    genome_list, goal = batch_data
+    results = []
+    for genome in genome_list:
+        result = evaluate_genome_parallel((genome, goal))
+        results.append(result)
+    return results
+
+
 # ============================================================
 # 6. Genome Visualization
 # ============================================================
 
-def visualize_genome(genome: Genome, filename: str, title: str = "Genome"):
+# Global dictionary to store genomes for discovered technologies
+# Maps component name -> Genome that created it
+_discovered_genomes: Dict[str, Genome] = {}
+
+
+def visualize_genome_detailed(genome: Genome, filename: str, title: str = "Genome", 
+                                discovered_genomes: Optional[Dict[str, Genome]] = None,
+                                visited: Optional[set] = None, prefix: str = ""):
+    """
+    Detailed visualization that recursively expands discovered technologies to show their internal structure.
+    """
+    if discovered_genomes is None:
+        discovered_genomes = _discovered_genomes
+    if visited is None:
+        visited = set()
+    
+    G = nx.DiGraph()
+    node_positions = {}
+    y_level = 0
+    
+    # Add global inputs at the top
+    for i in range(genome.n_global_inputs):
+        node_id = f"{prefix}IN_{i}"
+        G.add_node(node_id, node_type='input', label=f"In{i}", level=0)
+        node_positions[node_id] = (i * 2, y_level)
+    
+    y_level = -1
+    
+    # Track which component instances have been expanded (so we can skip their original connections)
+    expanded_instances = set()
+    
+    # Process component instances
+    for inst in genome.instances:
+        comp_name = inst.component.name
+        
+        # Check if this is a discovered technology that we should expand
+        if discovered_genomes and comp_name in discovered_genomes and comp_name not in visited:
+            expanded_instances.add(inst.id)
+            # Recursively expand this component
+            visited.add(comp_name)
+            sub_genome = discovered_genomes[comp_name]
+            
+            # Create a subgraph for this component
+            sub_prefix = f"{prefix}C{inst.id}_"
+            sub_G, sub_positions, sub_height = visualize_genome_detailed(
+                sub_genome, "", "", discovered_genomes, visited.copy(), sub_prefix
+            )
+            
+            # Add subgraph nodes to main graph
+            for node, data in sub_G.nodes(data=True):
+                G.add_node(node, **data)
+                # Offset positions to place this subgraph
+                if node in sub_positions:
+                    x, y = sub_positions[node]
+                    node_positions[node] = (x + inst.id * 10, y + y_level)
+            
+            # Add subgraph edges
+            for u, v, data in sub_G.edges(data=True):
+                G.add_edge(u, v, **data)
+            
+            # Connect subgraph inputs to parent inputs
+            # Map component instance input pins to sub-genome global inputs
+            for in_pin in range(inst.component.function.n_inputs):
+                # Find what drives this input in the parent genome
+                for conn in genome.connections:
+                    if not conn.enabled:
+                        continue
+                    if conn.dst_type == 'comp_in' and conn.dst_id == (inst.id, in_pin):
+                        # This input is driven by conn.src
+                        if conn.src_type == 'global_in':
+                            src_node = f"{prefix}IN_{conn.src_id}"
+                        else:
+                            src_inst_id, src_pin = conn.src_id
+                            src_node = f"{prefix}C{src_inst_id}_out{src_pin}"
+                        
+                        # Connect to subgraph's global input (mapped from component input pin)
+                        # The sub-genome's global input index should match the component's input pin index
+                        dst_node = f"{sub_prefix}IN_{in_pin}"
+                        if src_node in G.nodes() and dst_node in G.nodes():
+                            G.add_edge(src_node, dst_node, edge_type='connection', color='blue', width=3)
+                        break
+            
+            # Connect subgraph outputs to parent outputs
+            # Map component instance output pins to sub-genome global outputs
+            for out_pin in range(inst.component.function.n_outputs):
+                src_node = f"{sub_prefix}OUT_{out_pin}"
+                # Find what this output drives in the parent genome
+                for conn in genome.connections:
+                    if not conn.enabled:
+                        continue
+                    if conn.src_type == 'comp_out' and conn.src_id == (inst.id, out_pin):
+                        if conn.dst_type == 'global_out':
+                            dst_node = f"{prefix}OUT_{conn.dst_id}"
+                        else:
+                            dst_inst_id, dst_pin = conn.dst_id
+                            dst_node = f"{prefix}C{dst_inst_id}_in{dst_pin}"
+                        
+                        if src_node in G.nodes() and dst_node in G.nodes():
+                            G.add_edge(src_node, dst_node, edge_type='connection', color='red', width=3)
+                        break
+            
+            y_level -= sub_height - 1
+        else:
+            # Regular component - show as before
+            for pin in range(inst.component.function.n_inputs):
+                node_id = f"{prefix}C{inst.id}_in{pin}"
+                G.add_node(node_id, node_type='comp_input', label=f"{comp_name}\nIn{pin}", comp_id=inst.id, level=1)
+                node_positions[node_id] = (inst.id * 2 + pin * 0.3, y_level)
+            
+            for pin in range(inst.component.function.n_outputs):
+                node_id = f"{prefix}C{inst.id}_out{pin}"
+                G.add_node(node_id, node_type='comp_output', label=f"{comp_name}\nOut{pin}", comp_id=inst.id, level=1)
+                node_positions[node_id] = (inst.id * 2 + pin * 0.3, y_level - 0.5)
+            
+            # Internal edges
+            for in_pin in range(inst.component.function.n_inputs):
+                for out_pin in range(inst.component.function.n_outputs):
+                    G.add_edge(f"{prefix}C{inst.id}_in{in_pin}", f"{prefix}C{inst.id}_out{out_pin}", 
+                              edge_type='internal', style='dashed')
+    
+    # Add global outputs at the bottom
+    y_level -= 1
+    for i in range(genome.n_global_outputs):
+        node_id = f"{prefix}OUT_{i}"
+        G.add_node(node_id, node_type='output', label=f"Out{i}", level=2)
+        node_positions[node_id] = (i * 2, y_level)
+    
+    # Add connections (but skip connections involving expanded components, as they're already handled)
+    for conn in genome.connections:
+        if not conn.enabled:
+            continue
+        
+        # Skip if this connection involves an expanded component instance
+        if conn.src_type == 'comp_out':
+            src_inst_id, _ = conn.src_id
+            if src_inst_id in expanded_instances:
+                continue  # Skip - already handled by sub-network expansion
+        
+        if conn.dst_type == 'comp_in':
+            dst_inst_id, _ = conn.dst_id
+            if dst_inst_id in expanded_instances:
+                continue  # Skip - already handled by sub-network expansion
+        
+        if conn.src_type == 'global_in':
+            src_node = f"{prefix}IN_{conn.src_id}"
+        else:
+            inst_id, pin = conn.src_id
+            src_node = f"{prefix}C{inst_id}_out{pin}"
+        
+        if conn.dst_type == 'global_out':
+            dst_node = f"{prefix}OUT_{conn.dst_id}"
+        else:
+            inst_id, pin = conn.dst_id
+            dst_node = f"{prefix}C{inst_id}_in{pin}"
+        
+        if src_node in G.nodes() and dst_node in G.nodes():
+            G.add_edge(src_node, dst_node, edge_type='connection')
+    
+    if filename:
+        # Use hierarchical layout
+        try:
+            pos = nx.nx_agraph.graphviz_layout(G, prog='dot')
+        except:
+            try:
+                # Fallback to hierarchical positioning
+                pos = {}
+                for node, (x, y) in node_positions.items():
+                    pos[node] = (x, -y)  # Flip y for top-to-bottom
+            except:
+                pos = nx.spring_layout(G, k=2, iterations=100)
+        
+        # Draw
+        plt.figure(figsize=(20, 14))
+        
+        # Color nodes by type
+        node_colors = []
+        for node in G.nodes():
+            node_type = G.nodes[node].get('node_type', 'unknown')
+            if node_type == 'input':
+                node_colors.append('#90EE90')  # Light green
+            elif node_type == 'output':
+                node_colors.append('#FFB6C1')  # Light pink
+            elif node_type == 'comp_input':
+                node_colors.append('#87CEEB')  # Sky blue
+            elif node_type == 'comp_output':
+                node_colors.append('#FFD700')  # Gold
+            else:
+                node_colors.append('#D3D3D3')  # Light gray
+        
+        # Draw nodes with borders
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=1000, 
+                               edgecolors='black', linewidths=2, alpha=0.9)
+        
+        # Draw edges
+        internal_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('edge_type') == 'internal']
+        
+        # Separate colored edges (for sub-graph connections)
+        # Get all connection edges with their data
+        all_connection_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get('edge_type') == 'connection']
+        blue_edges = [(u, v) for u, v, d in all_connection_edges if d.get('color') == 'blue']
+        red_edges = [(u, v) for u, v, d in all_connection_edges if d.get('color') == 'red']
+        black_edges = [(u, v) for u, v, d in all_connection_edges if d.get('color') != 'blue' and d.get('color') != 'red']
+        
+        nx.draw_networkx_edges(G, pos, edgelist=internal_edges, edge_color='gray', 
+                              style='dashed', arrows=True, arrowsize=15, width=1.5, alpha=0.4)
+        if blue_edges:
+            nx.draw_networkx_edges(G, pos, edgelist=blue_edges, edge_color='blue', 
+                                  arrows=True, arrowsize=20, arrowstyle='->', width=3, alpha=0.9)
+        if red_edges:
+            nx.draw_networkx_edges(G, pos, edgelist=red_edges, edge_color='red', 
+                                  arrows=True, arrowsize=20, arrowstyle='->', width=3, alpha=0.9)
+        if black_edges:
+            nx.draw_networkx_edges(G, pos, edgelist=black_edges, edge_color='black', 
+                                  arrows=True, arrowsize=20, arrowstyle='->', width=2.5, alpha=0.8)
+        
+        # Labels
+        labels = {n: G.nodes[n].get('label', n.split('_')[-1]) for n in G.nodes()}
+        nx.draw_networkx_labels(G, pos, labels, font_size=9, font_weight='bold')
+        
+        plt.title(title, fontsize=18, fontweight='bold', pad=20)
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(filename, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved detailed genome visualization: {filename}")
+    
+    return G, node_positions, abs(y_level) + 1
+
+
+def visualize_genome(genome: Genome, filename: str, title: str = "Genome", detailed: bool = False, 
+                     discovered_genomes: Optional[Dict[str, Genome]] = None):
     """
     Visualize a genome as a directed graph showing components and connections.
-    Saves to filename.
+    If detailed=True, recursively expands discovered technologies to show their internal structure.
     """
+    if detailed:
+        visualize_genome_detailed(genome, filename, title, discovered_genomes)
+        return
+    
     G = nx.DiGraph()
     
     # Add nodes
@@ -593,11 +841,14 @@ def visualize_genome(genome: Genome, filename: str, title: str = "Genome"):
         
         G.add_edge(src_node, dst_node, edge_type='connection')
     
-    # Layout
+    # Layout - use Kamada-Kawai for better visualization
     try:
-        pos = nx.spring_layout(G, k=1.5, iterations=50)
+        pos = nx.kamada_kawai_layout(G)
     except:
-        pos = nx.random_layout(G)
+        try:
+            pos = nx.spring_layout(G, k=1.5, iterations=50)
+        except:
+            pos = nx.random_layout(G)
     
     # Draw
     plt.figure(figsize=(12, 8))
@@ -661,7 +912,8 @@ def run_hybrid_evolution(
     init_with_library: bool = False,
     prob_add_connection: float = 0.8,
     prob_add_component: float = 0.2,
-    prob_remove_connection: float = 0.1
+    prob_remove_connection: float = 0.1,
+    use_detailed_viz: bool = False
 ):
     if seed is not None:
         random.seed(seed)
@@ -677,7 +929,8 @@ def run_hybrid_evolution(
         else:
             goal_names = "all_goals"
         
-        run_name = f"{goal_names}_gen{generations_per_goal}_pop{pop_size}_spec{speciation_threshold}_seed{seed if seed else 'random'}"
+        init_suffix = "libinit" if init_with_library else "minimal"
+        run_name = f"{goal_names}_{init_suffix}_gen{generations_per_goal}_pop{pop_size}_spec{speciation_threshold}_seed{seed if seed else 'random'}"
         
         wandb.init(
             project=wandb_project,
@@ -737,7 +990,26 @@ def run_hybrid_evolution(
                     g.instances.append(new_inst)
                 
                 # Wire them up randomly with multiple connections
-                num_connections = random.randint(num_components * 2, num_components * 5)
+                # Factor in number of input/output pins for better connectivity
+                total_input_pins = goal.target.n_inputs  # Global inputs
+                total_output_pins = goal.target.n_outputs  # Global outputs
+                
+                for inst in g.instances:
+                    total_input_pins += inst.component.function.n_inputs
+                    total_output_pins += inst.component.function.n_outputs
+                
+                # Calculate total possible connection points
+                # Sources: global inputs + component outputs
+                # Destinations: global outputs + component inputs
+                total_sources = goal.target.n_inputs + sum(inst.component.function.n_outputs for inst in g.instances)
+                total_destinations = goal.target.n_outputs + sum(inst.component.function.n_inputs for inst in g.instances)
+                
+                # Use a fraction of total possible connections, with minimum based on components
+                min_connections = max(num_components * 2, total_sources // 2, total_destinations // 2)
+                max_connections = min(num_components * 5, int(total_sources * total_destinations * 0.3))
+                max_connections = max(max_connections, min_connections)  # Ensure max >= min
+                
+                num_connections = random.randint(min_connections, max_connections) #was 2--5
                 for _ in range(num_connections):
                     mutate_add_connection(g, prob=1.0)
             else:
@@ -763,15 +1035,24 @@ def run_hybrid_evolution(
             best_unconnected = 0
             
             if num_workers > 1:
-                # Parallel evaluation
-                tasks = [(g, goal) for g in population]
+                # Parallel evaluation with batching to reduce pickling overhead
+                # Batching reduces the number of pickling operations and process communication overhead
+                # Each batch contains multiple genomes, reducing the per-genome overhead
+                batch_size = max(1, pop_size // (num_workers * 2))  # 2 batches per worker for better load balancing
+                batches = []
+                for i in range(0, len(population), batch_size):
+                    batch = population[i:i + batch_size]
+                    batches.append((batch, goal))
+                
                 results_map = {}
                 
                 with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                    futures = {executor.submit(evaluate_genome_parallel, task): task[0].id for task in tasks}
+                    futures = {executor.submit(evaluate_batch_parallel, batch_data): batch_data[0] 
+                              for batch_data in batches}
                     for future in as_completed(futures):
-                        genome_id, fitness, unconnected_count, phenotype, is_solved = future.result()
-                        results_map[genome_id] = (fitness, unconnected_count, phenotype, is_solved)
+                        batch_results = future.result()
+                        for genome_id, fitness, unconnected_count, phenotype, is_solved in batch_results:
+                            results_map[genome_id] = (fitness, unconnected_count, phenotype, is_solved)
                 
                 # Apply results to genomes
                 for g in population:
@@ -789,11 +1070,19 @@ def run_hybrid_evolution(
                         )
                         from tech_evolution import evaluate_and_maybe_add
                         evaluate_and_maybe_add(lib, new_comp)
+                        
+                        # Store the genome that created this technology
+                        _discovered_genomes[new_comp.name] = copy.deepcopy(g)
+                        
                         print(f"  SOLVED {goal.name} at Gen {generation}! Added {new_comp.name}")
                         
-                        # Visualize the solution
-                        viz_filename = f"genome_{goal.name}_solved.png"
-                        visualize_genome(g, viz_filename, title=f"Solution for {goal.name} (Gen {generation})")
+                        # Visualize the solution - always save both normal and detailed versions
+                        viz_filename_normal = f"genome_{goal.name}_solved.png"
+                        viz_filename_detailed = f"genome_{goal.name}_solved_detailed.png"
+                        visualize_genome(g, viz_filename_normal, title=f"Solution for {goal.name} (Gen {generation})", 
+                                        detailed=False, discovered_genomes=_discovered_genomes)
+                        visualize_genome(g, viz_filename_detailed, title=f"Solution for {goal.name} - Detailed (Gen {generation})", 
+                                        detailed=True, discovered_genomes=_discovered_genomes)
                         
                         # Log to wandb
                         if use_wandb:
@@ -804,7 +1093,8 @@ def run_hybrid_evolution(
                                 f"{goal.name}/solved_cost": cost,
                                 f"{goal.name}/solved_num_components": len(g.instances),
                                 f"{goal.name}/solved_num_connections": sum(1 for c in g.connections if c.enabled),
-                                f"{goal.name}/genome_viz": wandb.Image(viz_filename)
+                                f"{goal.name}/genome_viz": wandb.Image(viz_filename_normal),
+                                f"{goal.name}/genome_viz_detailed": wandb.Image(viz_filename_detailed)
                             })
                         break
                     
@@ -866,11 +1156,19 @@ def run_hybrid_evolution(
                         # Add to library if it's new/better
                         from tech_evolution import evaluate_and_maybe_add
                         evaluate_and_maybe_add(lib, new_comp)
+                        
+                        # Store the genome that created this technology
+                        _discovered_genomes[new_comp.name] = copy.deepcopy(g)
+                        
                         print(f"  SOLVED {goal.name} at Gen {generation}! Added {new_comp.name}")
                         
-                        # Visualize the solution
-                        viz_filename = f"genome_{goal.name}_solved.png"
-                        visualize_genome(g, viz_filename, title=f"Solution for {goal.name} (Gen {generation})")
+                        # Visualize the solution - always save both normal and detailed versions
+                        viz_filename_normal = f"genome_{goal.name}_solved.png"
+                        viz_filename_detailed = f"genome_{goal.name}_solved_detailed.png"
+                        visualize_genome(g, viz_filename_normal, title=f"Solution for {goal.name} (Gen {generation})",
+                                        detailed=False, discovered_genomes=_discovered_genomes)
+                        visualize_genome(g, viz_filename_detailed, title=f"Solution for {goal.name} - Detailed (Gen {generation})",
+                                        detailed=True, discovered_genomes=_discovered_genomes)
                         
                         # Log to wandb
                         if use_wandb:
@@ -881,7 +1179,8 @@ def run_hybrid_evolution(
                                 f"{goal.name}/solved_cost": cost,
                                 f"{goal.name}/solved_num_components": len(g.instances),
                                 f"{goal.name}/solved_num_connections": sum(1 for c in g.connections if c.enabled),
-                                f"{goal.name}/genome_viz": wandb.Image(viz_filename)
+                                f"{goal.name}/genome_viz": wandb.Image(viz_filename_normal),
+                                f"{goal.name}/genome_viz_detailed": wandb.Image(viz_filename_detailed)
                             })
                         
                         break
@@ -1016,6 +1315,7 @@ if __name__ == "__main__":
     parser.add_argument("--prob-add-connection", type=float, default=0.8, help="Probability of adding a connection during mutation (default: 0.8).")
     parser.add_argument("--prob-add-component", type=float, default=0.2, help="Probability of adding a component during mutation (default: 0.2).")
     parser.add_argument("--prob-remove-connection", type=float, default=0.1, help="Probability of removing a connection during mutation (default: 0.1).")
+    parser.add_argument("--detailed-viz", action="store_true", help="Use detailed visualization that recursively expands discovered technologies to show their internal networks.")
     
     args = parser.parse_args()
     
@@ -1038,5 +1338,6 @@ if __name__ == "__main__":
         init_with_library=args.init_with_library,
         prob_add_connection=args.prob_add_connection,
         prob_add_component=args.prob_add_component,
-        prob_remove_connection=args.prob_remove_connection
+        prob_remove_connection=args.prob_remove_connection,
+        use_detailed_viz=args.detailed_viz
     )
