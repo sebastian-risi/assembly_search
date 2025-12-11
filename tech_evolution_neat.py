@@ -1254,6 +1254,13 @@ def run_hybrid_evolution(
                     # Check if this genome improves the goal (exact match or better approximation)
                     new_comp = check_and_add_improvement(g, phenotype, goal, lib, generation)
                     
+                    # Update timeline visualization whenever a new technology is discovered
+                    if new_comp and use_wandb and _technology_timeline:
+                        timeline_filename = "technology_development_timeline.png"
+                        visualize_technology_timeline(timeline_filename, f"Technology Timeline (Gen {generation})")
+                        import wandb
+                        wandb.log({"technology_timeline": wandb.Image(timeline_filename)})
+                    
                     if new_comp and is_solved:
                         solved = True
                         cost = new_comp.cost
@@ -1331,6 +1338,13 @@ def run_hybrid_evolution(
                     is_solved = (fitness == max_dist)
                     new_comp = check_and_add_improvement(g, phenotype, goal, lib, generation)
                     
+                    # Update timeline visualization whenever a new technology is discovered
+                    if new_comp and use_wandb and _technology_timeline:
+                        timeline_filename = "technology_development_timeline.png"
+                        visualize_technology_timeline(timeline_filename, f"Technology Timeline (Gen {generation})")
+                        import wandb
+                        wandb.log({"technology_timeline": wandb.Image(timeline_filename)})
+                    
                     if new_comp and is_solved:
                         solved = True
                         cost = new_comp.cost
@@ -1402,6 +1416,12 @@ def run_hybrid_evolution(
                         log_dict[f"{goal.name}/best_approx_dist"] = best_dist
                         log_dict[f"{goal.name}/best_approx_cost"] = best_comp.cost
                         log_dict[f"{goal.name}/num_approximations"] = len(goal.best_components)
+                    
+                    # Update technology timeline visualization every 50 generations
+                    if generation % 50 == 0 and _technology_timeline:
+                        timeline_filename = "technology_development_timeline.png"
+                        visualize_technology_timeline(timeline_filename, f"Technology Timeline (Gen {generation})")
+                        log_dict["technology_timeline"] = wandb.Image(timeline_filename)
                     
                     wandb.log(log_dict)
 
